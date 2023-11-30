@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  push:
+    branches:
+    - main
+
+env:
+  AWS_REGION: us-west-2
+  AWS_SECRET_ACCESS_KEY: ${{secrets.AWS_SECRET_ACCESS_KEY}}
+  AWS_ACCESS_KEY_ID: ${{secrets.AWS_ACCESS_KEY_ID}}
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: google-github-actions/release-please-action@v3
+        id: release-please
+        with:
+          release-type: terraform-module
+          pull-request-title-pattern: "chore${scope}: release${component} ${version}"
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: 'Restore Nix Store Cache'
+        id: cache-nix-store-restore
+        uses: actions/cache/restore@v3
+        with:
+          path: /nix/store
+          key: nix-store
+      - uses: nicknovitski/nix-develop@v1
+      - name: 'Cache Nix Store'
+        id: cache-nix-store-save
+        uses: actions/cache/save@v3
+        with:
+          path: /nix/store
+          key: ${{ steps.cache-nix-store-restore.outputs.cache-primary-key }}
+      - run: terraform version
+      - uses: haythem/public-ip@v1.3
+        id: ip
+      - name: 'Restore Terraform Cache'
+        id: cache-terraform-restore
+        uses: actions/cache/restore@v3
+        with:
+          path: ./.terraform
+          key: terraform
+      - run: terraform init -upgrade
+      - name: 'Cache Terraform'
+        id: cache-terraform-save
+        uses: actions/cache/save@v3
+        with:
+          path: ./.terraform
+          key: ${{ steps.cache-terraform-restore.outputs.cache-primary-key }}
+# only run when release PR exists
+      - name: 'Remind to Review Plan'
+        if: steps.release-please.outputs.pr
+        uses: peter-evans/create-or-update-comment@v3
+        with:
+          issue-number: ${{ fromJson(steps.release-please.outputs.pr).number }}
+          body: |
+            Please make sure to review the plan before merging this PR!
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      - name: 'Show Plan'
+        id: terraform-plan
+        if: steps.release-please.outputs.pr
+        run: |
+          echo '${{secrets.AGE_SECRET_KEY}}' | age -d -i - -o terraform.tfstate terraform.tfstate.age
+          export TF_VAR_ip=${{ steps.ip.outputs.ipv4 }}
+          terraform init
+          rm -f plan.tfplan
+          echo '```' > plan.tfplan
+          echo '# terraform plan -input=false -no-color' >> plan.tfplan
+          terraform plan -input=false -no-color >> plan.tfplan
+          echo '```' >> plan.tfplan
+          rm -f terraform.tfstate
+      - name: 'Add plan to PR'
+        uses: peter-evans/create-or-update-comment@v3
+        if: steps.release-please.outputs.pr
+        with:
+          issue-number: ${{ fromJson(steps.release-please.outputs.pr).number }}
+          body-path: ./plan.tfplan
+# only run after release is created
+      - name: 'Apply plan'
+        if: ${{ steps.release-please.outputs.release_created }}
+        shell: bash
+        run: |
+          eval $(ssh-agent -s)
+          echo '${{secrets.AGE_SECRET_KEY}}' | age -d -i - -o ssh_key ssh.age
+          chmod 0600 ssh_key
+          ssh-add ssh_key
+          echo '${{secrets.AGE_SECRET_KEY}}' | age -d -i - -o terraform.tfstate terraform.tfstate.age
+          export TF_VAR_ip=${{ steps.ip.outputs.ipv4 }}
+          terraform init
+          terraform apply --auto-approve || true
+          rm -rf ssh_key
+          rm -rf terraform.tfstate.age
+          age -e -r '${{ secrets.AGE_PUBLIC_KEY }}' -o terraform.tfstate.age terraform.tfstate
+          rm -f terraform.tfstate
+          git config --global user.name 'automation'
+          git config --global user.email 'automation@users.noreply.github.com'
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/$GITHUB_REPOSITORY
+          git add terraform.tfstate.age
+          git commit -s -m "New State ${{github.job}}-${{github.run_id}}-${{github.run_number}}-${{github.run_attempt}}"
+          git push origin main

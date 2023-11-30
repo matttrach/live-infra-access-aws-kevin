@@ -5,3 +5,4 @@ terraform*
 override.*
 *_override.tf
 !terraform.md
+.DS_Store
